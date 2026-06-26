@@ -1,0 +1,14 @@
+[Unit]
+Description=Telegram bot for electricity outage notifications
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+WorkingDirectory=/root/bot_svet
+ExecStart=/root/bot_svet/start.sh
+Restart=always
+RestartSec=5
+
+[Install]
+WantedBy=multi-user.target

@@ -9,14 +9,17 @@ import sys
 import threading
 import time
 from contextlib import contextmanager
-from datetime import datetime
+from datetime import date as datetime_date
+from datetime import datetime, time as datetime_time, timedelta, timezone
 from typing import Any, Iterator
 from urllib.error import HTTPError, URLError
 from urllib.request import ProxyHandler, Request, build_opener, urlopen
+from zoneinfo import ZoneInfo
 
 
 BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN", "").strip()
 TELEGRAM_PROXY_URL = os.getenv("TELEGRAM_PROXY_URL", "").strip()
+BOT_TIMEZONE = os.getenv("BOT_TIMEZONE", "Europe/Moscow")
 ADMIN_IDS = {
     int(item.strip())
     for item in os.getenv("ADMIN_IDS", "").split(",")
@@ -63,6 +66,40 @@ ACTIVE_BROADCAST_LOCK = threading.Lock()
 PENDING_BROADCASTS: dict[str, tuple[list[str], str | None]] = {}
 PENDING_BROADCAST_LOCK = threading.Lock()
 PENDING_BROADCAST_COUNTER = itertools.count(1)
+
+try:
+    LOCAL_TZ = ZoneInfo(BOT_TIMEZONE)
+except Exception:
+    LOCAL_TZ = timezone(timedelta(hours=3))
+
+RU_MONTHS = {
+    "января": 1,
+    "февраля": 2,
+    "марта": 3,
+    "апреля": 4,
+    "мая": 5,
+    "июня": 6,
+    "июля": 7,
+    "августа": 8,
+    "сентября": 9,
+    "октября": 10,
+    "ноября": 11,
+    "декабря": 12,
+}
+RU_NUMBERS = {
+    "один": 1,
+    "одного": 1,
+    "два": 2,
+    "двух": 2,
+    "три": 3,
+    "трех": 3,
+    "четыре": 4,
+    "четырех": 4,
+    "пять": 5,
+    "пяти": 5,
+    "шесть": 6,
+    "шести": 6,
+}
 
 
 class TelegramApiError(Exception):
@@ -137,6 +174,35 @@ def init_db() -> None:
         }
         if "house" not in columns:
             conn.execute("ALTER TABLE subscribers ADD COLUMN house TEXT")
+
+        conn.execute(
+            """
+            CREATE TABLE IF NOT EXISTS scheduled_notifications (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                house TEXT NOT NULL,
+                notify_at TEXT NOT NULL,
+                outage_at TEXT NOT NULL,
+                message_text TEXT,
+                admin_chat_id INTEGER,
+                sent_at TEXT,
+                sent_count INTEGER,
+                failed_count INTEGER,
+                created_at TEXT NOT NULL
+            )
+            """
+        )
+        schedule_columns = {
+            row["name"]
+            for row in conn.execute("PRAGMA table_info(scheduled_notifications)").fetchall()
+        }
+        migrations = {
+            "admin_chat_id": "ALTER TABLE scheduled_notifications ADD COLUMN admin_chat_id INTEGER",
+            "sent_count": "ALTER TABLE scheduled_notifications ADD COLUMN sent_count INTEGER",
+            "failed_count": "ALTER TABLE scheduled_notifications ADD COLUMN failed_count INTEGER",
+        }
+        for column, statement in migrations.items():
+            if column not in schedule_columns:
+                conn.execute(statement)
 
 
 def add_subscriber(chat_id: int, username: str | None, first_name: str | None) -> None:
@@ -367,8 +433,7 @@ def build_broadcast_text(house: str, source_text: str | None = None) -> str:
     )
 
 
-def broadcast(house: str, source_text: str | None = None) -> tuple[int, int]:
-    text = build_broadcast_text(house, source_text)
+def broadcast_text_to_house(house: str, text: str) -> tuple[int, int]:
     sent = 0
     failed = 0
 
@@ -383,6 +448,10 @@ def broadcast(house: str, source_text: str | None = None) -> tuple[int, int]:
                 remove_subscriber(chat_id)
 
     return sent, failed
+
+
+def broadcast(house: str, source_text: str | None = None) -> tuple[int, int]:
+    return broadcast_text_to_house(house, build_broadcast_text(house, source_text))
 
 
 def parse_houses_from_segment(segment: str, address_key: str) -> list[str]:
@@ -427,6 +496,263 @@ def parse_houses_from_text(text: str) -> list[str]:
         if house_key not in found:
             found.append(house_key)
     return found
+
+
+def now_local() -> datetime:
+    return datetime.now(LOCAL_TZ)
+
+
+def parse_interval_hours(text: str) -> int | None:
+    normalized = text.lower().replace("ё", "е")
+    match = re.search(r"(?:интервал\w*|кажд\w*)\D{0,20}(\d{1,2})\s*час", normalized)
+    if match:
+        hours = int(match.group(1))
+    else:
+        word_match = re.search(
+            r"(?:интервал\w*|кажд\w*)\D{0,20}(один|одного|два|двух|три|трех|четыре|четырех|пять|пяти|шесть|шести)\s*час",
+            normalized,
+        )
+        if not word_match:
+            return None
+        hours = RU_NUMBERS[word_match.group(1)]
+    if hours <= 0 or hours > 12:
+        return None
+    return hours
+
+
+def parse_context_date(text: str, current_date: datetime_date) -> datetime_date:
+    normalized = text.lower().replace("ё", "е")
+    today = now_local().date()
+
+    if "сегодня" in normalized:
+        return today
+    if "завтра" in normalized:
+        return today + timedelta(days=1)
+
+    match = re.search(
+        r"\b(\d{1,2})\s+(января|февраля|марта|апреля|мая|июня|июля|августа|сентября|октября|ноября|декабря)\b",
+        normalized,
+    )
+    if not match:
+        return current_date
+
+    day = int(match.group(1))
+    month = RU_MONTHS[match.group(2)]
+    year = today.year
+    parsed = datetime(year, month, day, tzinfo=LOCAL_TZ).date()
+    if parsed < today - timedelta(days=180):
+        parsed = datetime(year + 1, month, day, tzinfo=LOCAL_TZ).date()
+    return parsed
+
+
+def parse_time_parts(hour_text: str, minute_text: str | None) -> tuple[int, int] | None:
+    hour = int(hour_text)
+    minute = int(minute_text or "0")
+    if hour == 24 and minute == 0:
+        return 24, 0
+    if hour < 0 or hour > 23 or minute < 0 or minute > 59:
+        return None
+    return hour, minute
+
+
+def combine_date_time(date_value: datetime_date, hour: int, minute: int) -> datetime:
+    if hour == 24:
+        return datetime.combine(date_value + timedelta(days=1), datetime_time(0, 0), LOCAL_TZ)
+    return datetime.combine(date_value, datetime_time(hour, minute), LOCAL_TZ)
+
+
+def find_outage_start_times(line: str) -> list[tuple[int, int]]:
+    normalized = line.lower().replace("ё", "е")
+    if "не план" in normalized:
+        return []
+
+    outage_words = r"(?:отключ\w*|выключ\w*|продолж\w*)"
+    time_value = r"(\d{1,2})(?:[:\-](\d{2}))?"
+    patterns = [
+        rf"{outage_words}[^.\n]{{0,80}}\bс\s*{time_value}",
+        rf"\bс\s*{time_value}[^.\n]{{0,80}}{outage_words}",
+    ]
+
+    starts: list[tuple[int, int]] = []
+    for pattern in patterns:
+        for match in re.finditer(pattern, normalized):
+            parsed = parse_time_parts(match.group(1), match.group(2))
+            if parsed and parsed not in starts:
+                starts.append(parsed)
+    return starts
+
+
+def parse_outage_schedule(text: str) -> list[datetime]:
+    interval_hours = parse_interval_hours(text)
+    if not interval_hours:
+        return []
+
+    cycle = timedelta(hours=interval_hours * 2)
+    current_date = now_local().date()
+    starts: list[datetime] = []
+
+    for raw_line in re.split(r"[\n;]+", text):
+        line = raw_line.strip()
+        if not line:
+            continue
+
+        current_date = parse_context_date(line, current_date)
+        for hour, minute in find_outage_start_times(line):
+            first_outage = combine_date_time(current_date, hour, minute)
+            horizon = first_outage + timedelta(hours=24)
+            outage_at = first_outage
+            while outage_at <= horizon:
+                starts.append(outage_at)
+                outage_at += cycle
+
+    now = now_local()
+    future_starts: list[datetime] = []
+    seen: set[str] = set()
+    for outage_at in sorted(starts):
+        while outage_at <= now:
+            outage_at += cycle
+        key = outage_at.isoformat()
+        if key not in seen:
+            seen.add(key)
+            future_starts.append(outage_at)
+
+    return future_starts[:12]
+
+
+def build_reminder_text(house: str, outage_at: datetime) -> str:
+    label = house_short_label(house)
+    outage_time = outage_at.astimezone(LOCAL_TZ).strftime("%H:%M")
+    return (
+        "⚠️ Напоминание\n\n"
+        f"Через 10 минут, ориентировочно в {outage_time}, возможно отключение электроэнергии.\n\n"
+        f"Адрес: {label}.\n\n"
+        "Пожалуйста, не пользуйтесь лифтом, выключите лишние электроприборы "
+        "и сохраните важные данные."
+    )
+
+
+def schedule_reminders(
+    admin_chat_id: int,
+    houses: list[str],
+    source_text: str | None,
+) -> tuple[int, list[str]]:
+    if not source_text:
+        return 0, []
+
+    outage_starts = parse_outage_schedule(source_text)
+    if not outage_starts:
+        return 0, []
+
+    now = now_local()
+    created = 0
+    preview: list[str] = []
+    with db() as conn:
+        for house in houses:
+            for outage_at in outage_starts:
+                if outage_at <= now:
+                    continue
+                notify_at = outage_at - timedelta(minutes=10)
+                if notify_at <= now:
+                    notify_at = now
+
+                exists = conn.execute(
+                    """
+                    SELECT id
+                    FROM scheduled_notifications
+                    WHERE house = ? AND outage_at = ? AND sent_at IS NULL
+                    LIMIT 1
+                    """,
+                    (
+                        house,
+                        outage_at.astimezone(LOCAL_TZ).isoformat(timespec="seconds"),
+                    ),
+                ).fetchone()
+                if exists:
+                    continue
+
+                conn.execute(
+                    """
+                    INSERT INTO scheduled_notifications (
+                        house, notify_at, outage_at, message_text,
+                        admin_chat_id, created_at
+                    )
+                    VALUES (?, ?, ?, ?, ?, ?)
+                    """,
+                    (
+                        house,
+                        notify_at.astimezone(LOCAL_TZ).isoformat(timespec="seconds"),
+                        outage_at.astimezone(LOCAL_TZ).isoformat(timespec="seconds"),
+                        source_text,
+                        admin_chat_id,
+                        now.isoformat(timespec="seconds"),
+                    ),
+                )
+                created += 1
+                if len(preview) < 8:
+                    preview.append(
+                        f"{house_label(house)}: {notify_at.strftime('%d.%m %H:%M')}"
+                    )
+
+    return created, preview
+
+
+def schedule_confirmation_text(source_text: str) -> str | None:
+    outage_starts = parse_outage_schedule(source_text)
+    if not outage_starts:
+        return None
+
+    preview = [
+        outage_at.astimezone(LOCAL_TZ).strftime("%d.%m %H:%M")
+        for outage_at in outage_starts[:6]
+    ]
+    lines = [
+        "Также распознал расписание и после подтверждения поставлю напоминания за 10 минут:",
+        *preview,
+    ]
+    if len(outage_starts) > len(preview):
+        lines.append(f"И еще {len(outage_starts) - len(preview)} по этому графику.")
+    return "\n".join(lines)
+
+
+def due_scheduled_notifications() -> list[sqlite3.Row]:
+    now_iso = now_local().isoformat(timespec="seconds")
+    with db() as conn:
+        rows = conn.execute(
+            """
+            SELECT *
+            FROM scheduled_notifications
+            WHERE sent_at IS NULL AND notify_at <= ?
+            ORDER BY notify_at ASC
+            LIMIT 20
+            """,
+            (now_iso,),
+        ).fetchall()
+    return rows
+
+
+def mark_scheduled_notification_sent(notification_id: int, sent: int, failed: int) -> None:
+    with db() as conn:
+        conn.execute(
+            """
+            UPDATE scheduled_notifications
+            SET sent_at = ?, sent_count = ?, failed_count = ?
+            WHERE id = ?
+            """,
+            (now_local().isoformat(timespec="seconds"), sent, failed, notification_id),
+        )
+
+
+def scheduled_notification_worker() -> None:
+    while not STOP:
+        try:
+            for row in due_scheduled_notifications():
+                outage_at = datetime.fromisoformat(row["outage_at"]).astimezone(LOCAL_TZ)
+                text = build_reminder_text(row["house"], outage_at)
+                sent, failed = broadcast_text_to_house(row["house"], text)
+                mark_scheduled_notification_sent(int(row["id"]), sent, failed)
+        except Exception as error:
+            print(f"Scheduled notification error: {error}", file=sys.stderr)
+        time.sleep(20)
 
 
 def enqueue_broadcast(admin_chat_id: int, house: str, source_text: str | None = None) -> bool:
@@ -504,9 +830,16 @@ def handle_message(message: dict[str, Any]) -> None:
         if houses:
             houses_text = ", ".join(house_label(house) for house in houses)
             pending_id = create_pending_broadcast(houses, text)
+            message_text = (
+                f"Нашел дома: {houses_text}.\n"
+                "Оповестить об отключении электроэнергии?"
+            )
+            schedule_text = schedule_confirmation_text(text)
+            if schedule_text:
+                message_text = f"{message_text}\n\n{schedule_text}"
             send_message(
                 chat_id,
-                f"Нашел дома: {houses_text}.\nОповестить об отключении электроэнергии?",
+                message_text,
                 confirm_pending_broadcast_keyboard(pending_id),
             )
             return
@@ -657,12 +990,19 @@ def handle_callback(callback: dict[str, Any]) -> None:
             else:
                 skipped.append(house)
 
+        reminder_count, reminder_preview = schedule_reminders(chat_id, queued, source_text)
+
         answer_callback(callback_id, "Обработано")
         lines: list[str] = []
         if queued:
             lines.append(f"Поставил в очередь: {', '.join(house_label(house) for house in queued)}.")
         if skipped:
             lines.append(f"Уже идет рассылка: {', '.join(house_label(house) for house in skipped)}.")
+        if reminder_count:
+            lines.append(f"Поставил напоминания за 10 минут: {reminder_count}.")
+            lines.extend(reminder_preview)
+        elif source_text:
+            lines.append("Расписание по времени не распознал, напоминания не поставлены.")
         send_message(chat_id, "\n".join(lines))
         return
 
@@ -723,6 +1063,7 @@ def main() -> None:
     init_db()
     api("deleteWebhook", {"drop_pending_updates": False})
     threading.Thread(target=broadcast_worker, daemon=True).start()
+    threading.Thread(target=scheduled_notification_worker, daemon=True).start()
     print("Bot is running. Press Ctrl+C to stop.")
     poll_updates()
     print("Bot stopped.")

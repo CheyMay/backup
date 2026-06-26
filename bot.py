@@ -6,8 +6,9 @@ import sqlite3
 import sys
 import threading
 import time
+from contextlib import contextmanager
 from datetime import datetime
-from typing import Any
+from typing import Any, Iterator
 from urllib.error import HTTPError, URLError
 from urllib.request import ProxyHandler, Request, build_opener, urlopen
 
@@ -21,6 +22,7 @@ ADMIN_IDS = {
 }
 DB_PATH = os.getenv("DB_PATH", "bot.db")
 LOCATION_NAME = os.getenv("LOCATION_NAME", "вашем доме")
+HOUSES = ("1", "4", "5", "6", "9", "13")
 
 API_BASE = f"https://api.telegram.org/bot{BOT_TOKEN}"
 OPENER = (
@@ -36,7 +38,7 @@ OPENER = (
     ).open
 )
 STOP = False
-BROADCAST_QUEUE: queue.Queue[tuple[int, int]] = queue.Queue()
+BROADCAST_QUEUE: queue.Queue[tuple[int, str]] = queue.Queue()
 
 
 class TelegramApiError(Exception):
@@ -51,10 +53,15 @@ def on_stop(signum: int, frame: Any) -> None:
     STOP = True
 
 
-def db() -> sqlite3.Connection:
+@contextmanager
+def db() -> Iterator[sqlite3.Connection]:
     conn = sqlite3.connect(DB_PATH)
     conn.row_factory = sqlite3.Row
-    return conn
+    try:
+        yield conn
+        conn.commit()
+    finally:
+        conn.close()
 
 
 def init_db() -> None:
@@ -65,18 +72,25 @@ def init_db() -> None:
                 chat_id INTEGER PRIMARY KEY,
                 username TEXT,
                 first_name TEXT,
+                house TEXT,
                 subscribed_at TEXT NOT NULL
             )
             """
         )
+        columns = {
+            row["name"]
+            for row in conn.execute("PRAGMA table_info(subscribers)").fetchall()
+        }
+        if "house" not in columns:
+            conn.execute("ALTER TABLE subscribers ADD COLUMN house TEXT")
 
 
 def add_subscriber(chat_id: int, username: str | None, first_name: str | None) -> None:
     with db() as conn:
         conn.execute(
             """
-            INSERT INTO subscribers (chat_id, username, first_name, subscribed_at)
-            VALUES (?, ?, ?, ?)
+            INSERT INTO subscribers (chat_id, username, first_name, house, subscribed_at)
+            VALUES (?, ?, ?, NULL, ?)
             ON CONFLICT(chat_id) DO UPDATE SET
                 username = excluded.username,
                 first_name = excluded.first_name
@@ -85,15 +99,51 @@ def add_subscriber(chat_id: int, username: str | None, first_name: str | None) -
         )
 
 
+def set_subscriber_house(chat_id: int, house: str) -> None:
+    with db() as conn:
+        conn.execute(
+            "UPDATE subscribers SET house = ? WHERE chat_id = ?",
+            (house, chat_id),
+        )
+
+
 def remove_subscriber(chat_id: int) -> None:
     with db() as conn:
         conn.execute("DELETE FROM subscribers WHERE chat_id = ?", (chat_id,))
 
 
-def list_subscribers() -> list[int]:
+def list_subscribers_by_house(house: str) -> list[int]:
     with db() as conn:
-        rows = conn.execute("SELECT chat_id FROM subscribers").fetchall()
+        rows = conn.execute(
+            "SELECT chat_id FROM subscribers WHERE house = ?",
+            (house,),
+        ).fetchall()
     return [int(row["chat_id"]) for row in rows]
+
+
+def count_subscribers_by_house() -> dict[str, int]:
+    counts = {house: 0 for house in HOUSES}
+    with db() as conn:
+        rows = conn.execute(
+            """
+            SELECT COALESCE(house, '') AS house, COUNT(*) AS count
+            FROM subscribers
+            GROUP BY COALESCE(house, '')
+            """
+        ).fetchall()
+
+    without_house = 0
+    for row in rows:
+        house = str(row["house"])
+        count = int(row["count"])
+        if house in counts:
+            counts[house] = count
+        else:
+            without_house += count
+
+    if without_house:
+        counts["Без дома"] = without_house
+    return counts
 
 
 def api(method: str, payload: dict[str, Any], timeout: int = 20) -> Any:
@@ -139,33 +189,50 @@ def answer_callback(callback_id: str, text: str = "") -> None:
 def admin_keyboard() -> dict[str, Any]:
     return {
         "inline_keyboard": [
-            [{"text": "Отключение через 5 минут", "callback_data": "broadcast:5"}],
-            [{"text": "Отключение через 10 минут", "callback_data": "broadcast:10"}],
-            [{"text": "Отключение через 15 минут", "callback_data": "broadcast:15"}],
+            [{"text": "Оповестить об отключении", "callback_data": "admin_outage"}],
             [{"text": "Сколько подписчиков", "callback_data": "stats"}],
         ]
     }
 
 
+def house_keyboard(prefix: str) -> dict[str, Any]:
+    return {
+        "inline_keyboard": [
+            [
+                {"text": f"Дом {HOUSES[index]}", "callback_data": f"{prefix}:{HOUSES[index]}"},
+                {"text": f"Дом {HOUSES[index + 1]}", "callback_data": f"{prefix}:{HOUSES[index + 1]}"},
+            ]
+            for index in range(0, len(HOUSES), 2)
+        ]
+    }
+
+
+def admin_house_keyboard() -> dict[str, Any]:
+    keyboard = house_keyboard("broadcast_house")
+    keyboard["inline_keyboard"].append([{"text": "Назад", "callback_data": "admin_back"}])
+    return keyboard
+
+
 def start_keyboard() -> dict[str, Any]:
     return {
         "inline_keyboard": [
+            [{"text": "Изменить дом", "callback_data": "choose_house"}],
             [{"text": "Отписаться", "callback_data": "unsubscribe"}],
         ]
     }
 
 
-def broadcast(minutes: int) -> tuple[int, int]:
+def broadcast(house: str) -> tuple[int, int]:
     text = (
         "❗️❗️❗️ Важная информация\n\n"
-        f"Через {minutes} минут будет отключение электроэнергии в {LOCATION_NAME}.\n\n"
+        f"В доме {house} будет отключение электроэнергии.\n\n"
         "Пожалуйста, не пользуйтесь лифтом, чтобы не застрять в нем. "
         "Заранее завершите важные дела и сохраните данные."
     )
     sent = 0
     failed = 0
 
-    for chat_id in list_subscribers():
+    for chat_id in list_subscribers_by_house(house):
         try:
             send_message(chat_id, text)
             sent += 1
@@ -178,23 +245,23 @@ def broadcast(minutes: int) -> tuple[int, int]:
     return sent, failed
 
 
-def enqueue_broadcast(admin_chat_id: int, minutes: int) -> None:
-    BROADCAST_QUEUE.put((admin_chat_id, minutes))
+def enqueue_broadcast(admin_chat_id: int, house: str) -> None:
+    BROADCAST_QUEUE.put((admin_chat_id, house))
 
 
 def broadcast_worker() -> None:
     while not STOP:
         try:
-            admin_chat_id, minutes = BROADCAST_QUEUE.get(timeout=1)
+            admin_chat_id, house = BROADCAST_QUEUE.get(timeout=1)
         except queue.Empty:
             continue
 
         try:
-            send_message(admin_chat_id, f"Рассылка на {minutes} минут запущена.")
-            sent, failed = broadcast(minutes)
+            send_message(admin_chat_id, f"Рассылка по дому {house} запущена.")
+            sent, failed = broadcast(house)
             send_message(
                 admin_chat_id,
-                f"Рассылка завершена. Доставлено: {sent}. Ошибок: {failed}.",
+                f"Дом {house}: рассылка завершена. Доставлено: {sent}. Ошибок: {failed}.",
             )
         except Exception as error:
             try:
@@ -223,8 +290,8 @@ def handle_message(message: dict[str, Any]) -> None:
         add_subscriber(chat_id, user.get("username"), user.get("first_name"))
         send_message(
             chat_id,
-            "Вы подписаны на уведомления об отключении света.",
-            start_keyboard(),
+            "Выберите ваш дом, чтобы получать уведомления только по нему:",
+            house_keyboard("house"),
         )
         return
 
@@ -237,12 +304,7 @@ def handle_message(message: dict[str, Any]) -> None:
         if not is_admin(user_id):
             send_message(chat_id, "Нет доступа.")
             return
-        send_message(chat_id, "Выберите рассылку:", admin_keyboard())
-        return
-
-    if is_admin(user_id) and text in {"5", "10", "15"}:
-        enqueue_broadcast(chat_id, int(text))
-        send_message(chat_id, f"Рассылка на {text} минут поставлена в очередь.")
+        send_message(chat_id, "Панель администратора:", admin_keyboard())
         return
 
     send_message(chat_id, "Команды: /start - подписаться, /stop - отписаться.")
@@ -262,20 +324,59 @@ def handle_callback(callback: dict[str, Any]) -> None:
         send_message(chat_id, "Вы отписались от уведомлений.")
         return
 
+    if data == "choose_house" and chat_id:
+        add_subscriber(chat_id, user.get("username"), user.get("first_name"))
+        answer_callback(callback_id)
+        send_message(chat_id, "Выберите ваш дом:", house_keyboard("house"))
+        return
+
+    if data.startswith("house:") and chat_id:
+        house = data.split(":", 1)[1]
+        if house not in HOUSES:
+            answer_callback(callback_id, "Неизвестный дом")
+            return
+        add_subscriber(chat_id, user.get("username"), user.get("first_name"))
+        set_subscriber_house(chat_id, house)
+        answer_callback(callback_id, f"Дом {house} сохранен")
+        send_message(
+            chat_id,
+            f"Дом {house} сохранен. Вы подписаны на уведомления.",
+            start_keyboard(),
+        )
+        return
+
     if not is_admin(user_id):
         answer_callback(callback_id, "Нет доступа")
         return
 
     if data == "stats" and chat_id:
-        count = len(list_subscribers())
+        counts = count_subscribers_by_house()
+        total = sum(counts.values())
+        lines = [f"Подписчиков всего: {total}.", ""]
+        lines.extend(f"Дом {house}: {counts.get(house, 0)}" for house in HOUSES)
+        if counts.get("Без дома", 0):
+            lines.append(f"Без дома: {counts['Без дома']}")
         answer_callback(callback_id)
-        send_message(chat_id, f"Подписчиков: {count}.", admin_keyboard())
+        send_message(chat_id, "\n".join(lines), admin_keyboard())
         return
 
-    if data.startswith("broadcast:") and chat_id:
-        minutes = int(data.split(":", 1)[1])
-        enqueue_broadcast(chat_id, minutes)
-        answer_callback(callback_id, "Рассылка поставлена в очередь")
+    if data == "admin_outage" and chat_id:
+        answer_callback(callback_id)
+        send_message(chat_id, "Выберите дом для оповещения:", admin_house_keyboard())
+        return
+
+    if data == "admin_back" and chat_id:
+        answer_callback(callback_id)
+        send_message(chat_id, "Панель администратора:", admin_keyboard())
+        return
+
+    if data.startswith("broadcast_house:") and chat_id:
+        house = data.split(":", 1)[1]
+        if house not in HOUSES:
+            answer_callback(callback_id, "Неизвестный дом")
+            return
+        enqueue_broadcast(chat_id, house)
+        answer_callback(callback_id, f"Дом {house}: рассылка поставлена")
         return
 
     answer_callback(callback_id)

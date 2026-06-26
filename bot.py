@@ -39,6 +39,8 @@ OPENER = (
 )
 STOP = False
 BROADCAST_QUEUE: queue.Queue[tuple[int, str]] = queue.Queue()
+ACTIVE_BROADCAST_HOUSES: set[str] = set()
+ACTIVE_BROADCAST_LOCK = threading.Lock()
 
 
 class TelegramApiError(Exception):
@@ -105,6 +107,17 @@ def set_subscriber_house(chat_id: int, house: str) -> None:
             "UPDATE subscribers SET house = ? WHERE chat_id = ?",
             (house, chat_id),
         )
+
+
+def get_subscriber_house(chat_id: int) -> str | None:
+    with db() as conn:
+        row = conn.execute(
+            "SELECT house FROM subscribers WHERE chat_id = ?",
+            (chat_id,),
+        ).fetchone()
+    if not row:
+        return None
+    return row["house"]
 
 
 def remove_subscriber(chat_id: int) -> None:
@@ -213,6 +226,15 @@ def admin_house_keyboard() -> dict[str, Any]:
     return keyboard
 
 
+def confirm_broadcast_keyboard(house: str) -> dict[str, Any]:
+    return {
+        "inline_keyboard": [
+            [{"text": "Да, отправить", "callback_data": f"confirm_broadcast:{house}"}],
+            [{"text": "Отмена", "callback_data": "cancel_broadcast"}],
+        ]
+    }
+
+
 def start_keyboard() -> dict[str, Any]:
     return {
         "inline_keyboard": [
@@ -245,8 +267,13 @@ def broadcast(house: str) -> tuple[int, int]:
     return sent, failed
 
 
-def enqueue_broadcast(admin_chat_id: int, house: str) -> None:
+def enqueue_broadcast(admin_chat_id: int, house: str) -> bool:
+    with ACTIVE_BROADCAST_LOCK:
+        if house in ACTIVE_BROADCAST_HOUSES:
+            return False
+        ACTIVE_BROADCAST_HOUSES.add(house)
     BROADCAST_QUEUE.put((admin_chat_id, house))
+    return True
 
 
 def broadcast_worker() -> None:
@@ -269,6 +296,8 @@ def broadcast_worker() -> None:
             except Exception:
                 pass
         finally:
+            with ACTIVE_BROADCAST_LOCK:
+                ACTIVE_BROADCAST_HOUSES.discard(house)
             BROADCAST_QUEUE.task_done()
 
 
@@ -336,6 +365,10 @@ def handle_callback(callback: dict[str, Any]) -> None:
             answer_callback(callback_id, "Неизвестный дом")
             return
         add_subscriber(chat_id, user.get("username"), user.get("first_name"))
+        current_house = get_subscriber_house(chat_id)
+        if current_house == house:
+            answer_callback(callback_id, f"Дом {house} уже выбран")
+            return
         set_subscriber_house(chat_id, house)
         answer_callback(callback_id, f"Дом {house} сохранен")
         send_message(
@@ -375,8 +408,30 @@ def handle_callback(callback: dict[str, Any]) -> None:
         if house not in HOUSES:
             answer_callback(callback_id, "Неизвестный дом")
             return
-        enqueue_broadcast(chat_id, house)
+        answer_callback(callback_id)
+        send_message(
+            chat_id,
+            f"Оповестить дом {house} об отключении электроэнергии?",
+            confirm_broadcast_keyboard(house),
+        )
+        return
+
+    if data.startswith("confirm_broadcast:") and chat_id:
+        house = data.split(":", 1)[1]
+        if house not in HOUSES:
+            answer_callback(callback_id, "Неизвестный дом")
+            return
+        queued = enqueue_broadcast(chat_id, house)
+        if not queued:
+            answer_callback(callback_id, f"Дом {house}: рассылка уже идет")
+            return
         answer_callback(callback_id, f"Дом {house}: рассылка поставлена")
+        send_message(chat_id, f"Дом {house}: рассылка поставлена в очередь.")
+        return
+
+    if data == "cancel_broadcast" and chat_id:
+        answer_callback(callback_id, "Отменено")
+        send_message(chat_id, "Рассылка отменена.", admin_keyboard())
         return
 
     answer_callback(callback_id)

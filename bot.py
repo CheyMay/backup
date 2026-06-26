@@ -1,5 +1,6 @@
 import json
 import os
+import queue
 import signal
 import sqlite3
 import sys
@@ -35,6 +36,7 @@ OPENER = (
     ).open
 )
 STOP = False
+BROADCAST_QUEUE: queue.Queue[tuple[int, int]] = queue.Queue()
 
 
 class TelegramApiError(Exception):
@@ -94,7 +96,7 @@ def list_subscribers() -> list[int]:
     return [int(row["chat_id"]) for row in rows]
 
 
-def api(method: str, payload: dict[str, Any]) -> Any:
+def api(method: str, payload: dict[str, Any], timeout: int = 20) -> Any:
     data = json.dumps(payload).encode("utf-8")
     request = Request(
         f"{API_BASE}/{method}",
@@ -104,7 +106,7 @@ def api(method: str, payload: dict[str, Any]) -> Any:
     )
 
     try:
-        with OPENER(request, timeout=40) as response:
+        with OPENER(request, timeout=timeout) as response:
             body = json.loads(response.read().decode("utf-8"))
     except HTTPError as error:
         body = json.loads(error.read().decode("utf-8"))
@@ -124,14 +126,14 @@ def send_message(chat_id: int, text: str, reply_markup: dict[str, Any] | None = 
     }
     if reply_markup:
         payload["reply_markup"] = reply_markup
-    api("sendMessage", payload)
+    api("sendMessage", payload, timeout=15)
 
 
 def answer_callback(callback_id: str, text: str = "") -> None:
     payload = {"callback_query_id": callback_id}
     if text:
         payload["text"] = text
-    api("answerCallbackQuery", payload)
+    api("answerCallbackQuery", payload, timeout=8)
 
 
 def admin_keyboard() -> dict[str, Any]:
@@ -176,25 +178,31 @@ def broadcast(minutes: int) -> tuple[int, int]:
     return sent, failed
 
 
-def broadcast_and_report(admin_chat_id: int, minutes: int) -> None:
-    try:
-        sent, failed = broadcast(minutes)
-        send_message(
-            admin_chat_id,
-            f"Рассылка завершена. Доставлено: {sent}. Ошибок: {failed}.",
-        )
-    except Exception as error:
-        send_message(admin_chat_id, f"Ошибка рассылки: {error}")
+def enqueue_broadcast(admin_chat_id: int, minutes: int) -> None:
+    BROADCAST_QUEUE.put((admin_chat_id, minutes))
 
 
-def start_broadcast(admin_chat_id: int, minutes: int) -> None:
-    send_message(admin_chat_id, f"Рассылка на {minutes} минут запущена.")
-    thread = threading.Thread(
-        target=broadcast_and_report,
-        args=(admin_chat_id, minutes),
-        daemon=True,
-    )
-    thread.start()
+def broadcast_worker() -> None:
+    while not STOP:
+        try:
+            admin_chat_id, minutes = BROADCAST_QUEUE.get(timeout=1)
+        except queue.Empty:
+            continue
+
+        try:
+            send_message(admin_chat_id, f"Рассылка на {minutes} минут запущена.")
+            sent, failed = broadcast(minutes)
+            send_message(
+                admin_chat_id,
+                f"Рассылка завершена. Доставлено: {sent}. Ошибок: {failed}.",
+            )
+        except Exception as error:
+            try:
+                send_message(admin_chat_id, f"Ошибка рассылки: {error}")
+            except Exception:
+                pass
+        finally:
+            BROADCAST_QUEUE.task_done()
 
 
 def is_admin(user_id: int | None) -> bool:
@@ -233,7 +241,8 @@ def handle_message(message: dict[str, Any]) -> None:
         return
 
     if is_admin(user_id) and text in {"5", "10", "15"}:
-        start_broadcast(chat_id, int(text))
+        enqueue_broadcast(chat_id, int(text))
+        send_message(chat_id, f"Рассылка на {text} минут поставлена в очередь.")
         return
 
     send_message(chat_id, "Команды: /start - подписаться, /stop - отписаться.")
@@ -265,8 +274,8 @@ def handle_callback(callback: dict[str, Any]) -> None:
 
     if data.startswith("broadcast:") and chat_id:
         minutes = int(data.split(":", 1)[1])
-        answer_callback(callback_id, "Рассылка запущена")
-        start_broadcast(chat_id, minutes)
+        enqueue_broadcast(chat_id, minutes)
+        answer_callback(callback_id, "Рассылка поставлена в очередь")
         return
 
     answer_callback(callback_id)
@@ -313,6 +322,7 @@ def main() -> None:
 
     init_db()
     api("deleteWebhook", {"drop_pending_updates": False})
+    threading.Thread(target=broadcast_worker, daemon=True).start()
     print("Bot is running. Press Ctrl+C to stop.")
     poll_updates()
     print("Bot stopped.")

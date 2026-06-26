@@ -3,6 +3,7 @@ import os
 import signal
 import sqlite3
 import sys
+import threading
 import time
 from datetime import datetime
 from typing import Any
@@ -175,6 +176,27 @@ def broadcast(minutes: int) -> tuple[int, int]:
     return sent, failed
 
 
+def broadcast_and_report(admin_chat_id: int, minutes: int) -> None:
+    try:
+        sent, failed = broadcast(minutes)
+        send_message(
+            admin_chat_id,
+            f"Рассылка завершена. Доставлено: {sent}. Ошибок: {failed}.",
+        )
+    except Exception as error:
+        send_message(admin_chat_id, f"Ошибка рассылки: {error}")
+
+
+def start_broadcast(admin_chat_id: int, minutes: int) -> None:
+    send_message(admin_chat_id, f"Рассылка на {minutes} минут запущена.")
+    thread = threading.Thread(
+        target=broadcast_and_report,
+        args=(admin_chat_id, minutes),
+        daemon=True,
+    )
+    thread.start()
+
+
 def is_admin(user_id: int | None) -> bool:
     return user_id in ADMIN_IDS
 
@@ -211,8 +233,7 @@ def handle_message(message: dict[str, Any]) -> None:
         return
 
     if is_admin(user_id) and text in {"5", "10", "15"}:
-        sent, failed = broadcast(int(text))
-        send_message(chat_id, f"Рассылка отправлена. Доставлено: {sent}. Ошибок: {failed}.")
+        start_broadcast(chat_id, int(text))
         return
 
     send_message(chat_id, "Команды: /start - подписаться, /stop - отписаться.")
@@ -244,9 +265,8 @@ def handle_callback(callback: dict[str, Any]) -> None:
 
     if data.startswith("broadcast:") and chat_id:
         minutes = int(data.split(":", 1)[1])
-        answer_callback(callback_id, "Отправляю рассылку")
-        sent, failed = broadcast(minutes)
-        send_message(chat_id, f"Рассылка отправлена. Доставлено: {sent}. Ошибок: {failed}.")
+        answer_callback(callback_id, "Рассылка запущена")
+        start_broadcast(chat_id, minutes)
         return
 
     answer_callback(callback_id)

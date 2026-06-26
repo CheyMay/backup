@@ -24,7 +24,24 @@ ADMIN_IDS = {
 }
 DB_PATH = os.getenv("DB_PATH", "bot.db")
 LOCATION_NAME = os.getenv("LOCATION_NAME", "вашем доме")
-HOUSES = ("1", "4", "5", "6", "9", "13")
+ADDRESS_HOUSES = {
+    "kw": {
+        "name": "Крымской весны",
+        "houses": ("1", "4", "5", "6", "9", "13"),
+        "markers": ("крымск",),
+    },
+    "mr": {
+        "name": "Мраморный",
+        "houses": ("36", "38", "40"),
+        "markers": ("мрамор",),
+    },
+}
+LEGACY_HOUSES = ADDRESS_HOUSES["kw"]["houses"]
+HOUSE_KEYS = tuple(
+    f"{address_key}:{house}"
+    for address_key, address in ADDRESS_HOUSES.items()
+    for house in address["houses"]
+)
 
 API_BASE = f"https://api.telegram.org/bot{BOT_TOKEN}"
 OPENER = (
@@ -53,6 +70,36 @@ class TelegramApiError(Exception):
         self.status = status
         self.description = description
         super().__init__(f"{status}: {description}")
+
+
+def normalize_house_key(house: str | None) -> str | None:
+    if not house:
+        return None
+    if house in HOUSE_KEYS:
+        return house
+    if house in LEGACY_HOUSES:
+        return f"kw:{house}"
+    return None
+
+
+def callback_value(data: str, prefix: str) -> str:
+    return data[len(prefix) :]
+
+
+def house_label(house_key: str) -> str:
+    normalized = normalize_house_key(house_key)
+    if not normalized:
+        return house_key
+    address_key, house = normalized.split(":", 1)
+    return f"{ADDRESS_HOUSES[address_key]['name']} {house}"
+
+
+def house_short_label(house_key: str) -> str:
+    normalized = normalize_house_key(house_key)
+    if not normalized:
+        return f"Дом {house_key}"
+    address_key, house = normalized.split(":", 1)
+    return f"{ADDRESS_HOUSES[address_key]['name']}, дом {house}"
 
 
 def on_stop(signum: int, frame: Any) -> None:
@@ -131,16 +178,26 @@ def remove_subscriber(chat_id: int) -> None:
 
 
 def list_subscribers_by_house(house: str) -> list[int]:
+    normalized = normalize_house_key(house)
+    if not normalized:
+        return []
+
+    address_key, house_number = normalized.split(":", 1)
+    lookup_values = [normalized]
+    if address_key == "kw":
+        lookup_values.append(house_number)
+
+    placeholders = ",".join("?" for _ in lookup_values)
     with db() as conn:
         rows = conn.execute(
-            "SELECT chat_id FROM subscribers WHERE house = ?",
-            (house,),
+            f"SELECT chat_id FROM subscribers WHERE house IN ({placeholders})",
+            tuple(lookup_values),
         ).fetchall()
     return [int(row["chat_id"]) for row in rows]
 
 
 def count_subscribers_by_house() -> dict[str, int]:
-    counts = {house: 0 for house in HOUSES}
+    counts = {house: 0 for house in HOUSE_KEYS}
     with db() as conn:
         rows = conn.execute(
             """
@@ -152,9 +209,9 @@ def count_subscribers_by_house() -> dict[str, int]:
 
     without_house = 0
     for row in rows:
-        house = str(row["house"])
+        house = normalize_house_key(str(row["house"]))
         count = int(row["count"])
-        if house in counts:
+        if house and house in counts:
             counts[house] = count
         else:
             without_house += count
@@ -214,15 +271,26 @@ def admin_keyboard() -> dict[str, Any]:
 
 
 def house_keyboard(prefix: str) -> dict[str, Any]:
-    return {
-        "inline_keyboard": [
-            [
-                {"text": f"Дом {HOUSES[index]}", "callback_data": f"{prefix}:{HOUSES[index]}"},
-                {"text": f"Дом {HOUSES[index + 1]}", "callback_data": f"{prefix}:{HOUSES[index + 1]}"},
+    rows: list[list[dict[str, str]]] = []
+    for address_key, address in ADDRESS_HOUSES.items():
+        rows.append([{"text": str(address["name"]), "callback_data": "noop"}])
+        houses = address["houses"]
+        for index in range(0, len(houses), 2):
+            row = [
+                {
+                    "text": f"Дом {houses[index]}",
+                    "callback_data": f"{prefix}:{address_key}:{houses[index]}",
+                }
             ]
-            for index in range(0, len(HOUSES), 2)
-        ]
-    }
+            if index + 1 < len(houses):
+                row.append(
+                    {
+                        "text": f"Дом {houses[index + 1]}",
+                        "callback_data": f"{prefix}:{address_key}:{houses[index + 1]}",
+                    }
+                )
+            rows.append(row)
+    return {"inline_keyboard": rows}
 
 
 def admin_house_keyboard() -> dict[str, Any]:
@@ -286,13 +354,14 @@ def format_engineer_message(text: str) -> str:
 
 
 def build_broadcast_text(house: str, source_text: str | None = None) -> str:
+    label = house_short_label(house)
     if source_text:
         message = format_engineer_message(source_text)
-        return f"❗️❗️❗️ Важная информация\n\nДом {house}\n\n{message}"
+        return f"❗️❗️❗️ Важная информация\n\n{label}\n\n{message}"
 
     return (
         "❗️❗️❗️ Важная информация\n\n"
-        f"В доме {house} будет отключение электроэнергии.\n\n"
+        f"По адресу {label} будет отключение электроэнергии.\n\n"
         "Пожалуйста, не пользуйтесь лифтом, чтобы не застрять в нем. "
         "Заранее завершите важные дела и сохраните данные."
     )
@@ -316,33 +385,48 @@ def broadcast(house: str, source_text: str | None = None) -> tuple[int, int]:
     return sent, failed
 
 
-def parse_houses_from_segment(segment: str) -> list[str]:
+def parse_houses_from_segment(segment: str, address_key: str) -> list[str]:
     house_pattern = r"(?:дом(?:а|е|ов|ах)?|д\.)\s*(?:№\s*)?[:\-]?\s*([0-9\s,;./\\и№]+)"
     found: list[str] = []
+    allowed_houses = ADDRESS_HOUSES[address_key]["houses"]
 
     for match in re.finditer(house_pattern, segment):
         numbers = re.findall(r"\d+", match.group(1))
         for number in numbers:
-            if number in HOUSES and number not in found:
-                found.append(number)
+            house_key = f"{address_key}:{number}"
+            if number in allowed_houses and house_key not in found:
+                found.append(house_key)
 
     return found
 
 
 def parse_houses_from_text(text: str) -> list[str]:
     normalized = text.lower().replace("ё", "е")
+    found: list[str] = []
 
-    if "крымск" in normalized:
-        start = normalized.find("крымск")
-        segment = normalized[start:]
-        next_address = re.search(r"\b(?:переулок|пер\.|улица|ул\.)\b", segment[8:])
-        if next_address:
-            segment = segment[: 8 + next_address.start()]
-        houses = parse_houses_from_segment(segment)
-        if houses:
-            return houses
+    address_hits: list[tuple[int, str]] = []
+    for address_key, address in ADDRESS_HOUSES.items():
+        for marker in address["markers"]:
+            index = normalized.find(marker)
+            if index >= 0:
+                address_hits.append((index, address_key))
+                break
 
-    return parse_houses_from_segment(normalized)
+    address_hits.sort()
+    for position, (start, address_key) in enumerate(address_hits):
+        end = address_hits[position + 1][0] if position + 1 < len(address_hits) else len(normalized)
+        segment = normalized[start:end]
+        for house_key in parse_houses_from_segment(segment, address_key):
+            if house_key not in found:
+                found.append(house_key)
+
+    if found:
+        return found
+
+    for house_key in parse_houses_from_segment(normalized, "kw"):
+        if house_key not in found:
+            found.append(house_key)
+    return found
 
 
 def enqueue_broadcast(admin_chat_id: int, house: str, source_text: str | None = None) -> bool:
@@ -362,11 +446,12 @@ def broadcast_worker() -> None:
             continue
 
         try:
-            send_message(admin_chat_id, f"Рассылка по дому {house} запущена.")
+            label = house_short_label(house)
+            send_message(admin_chat_id, f"Рассылка: {label} запущена.")
             sent, failed = broadcast(house, source_text)
             send_message(
                 admin_chat_id,
-                f"Дом {house}: рассылка завершена. Доставлено: {sent}. Ошибок: {failed}.",
+                f"{label}: рассылка завершена. Доставлено: {sent}. Ошибок: {failed}.",
             )
         except Exception as error:
             try:
@@ -417,7 +502,7 @@ def handle_message(message: dict[str, Any]) -> None:
     if is_admin(user_id):
         houses = parse_houses_from_text(text)
         if houses:
-            houses_text = ", ".join(houses)
+            houses_text = ", ".join(house_label(house) for house in houses)
             pending_id = create_pending_broadcast(houses, text)
             send_message(
                 chat_id,
@@ -459,20 +544,20 @@ def handle_callback(callback: dict[str, Any]) -> None:
         return
 
     if data.startswith("house:") and chat_id:
-        house = data.split(":", 1)[1]
-        if house not in HOUSES:
+        house = normalize_house_key(callback_value(data, "house:"))
+        if not house:
             answer_callback(callback_id, "Неизвестный дом")
             return
         add_subscriber(chat_id, user.get("username"), user.get("first_name"))
-        current_house = get_subscriber_house(chat_id)
+        current_house = normalize_house_key(get_subscriber_house(chat_id))
         if current_house == house:
-            answer_callback(callback_id, f"Дом {house} уже выбран")
+            answer_callback(callback_id, f"{house_label(house)} уже выбран")
             return
         set_subscriber_house(chat_id, house)
-        answer_callback(callback_id, f"Дом {house} сохранен")
+        answer_callback(callback_id, f"{house_label(house)} сохранен")
         send_message(
             chat_id,
-            f"Дом {house} сохранен. Вы подписаны на уведомления.",
+            f"{house_label(house)} сохранен. Вы подписаны на уведомления.",
             start_keyboard(),
         )
         return
@@ -485,7 +570,7 @@ def handle_callback(callback: dict[str, Any]) -> None:
         counts = count_subscribers_by_house()
         total = sum(counts.values())
         lines = [f"Подписчиков всего: {total}.", ""]
-        lines.extend(f"Дом {house}: {counts.get(house, 0)}" for house in HOUSES)
+        lines.extend(f"{house_label(house)}: {counts.get(house, 0)}" for house in HOUSE_KEYS)
         if counts.get("Без дома", 0):
             lines.append(f"Без дома: {counts['Без дома']}")
         answer_callback(callback_id)
@@ -503,36 +588,37 @@ def handle_callback(callback: dict[str, Any]) -> None:
         return
 
     if data.startswith("broadcast_house:") and chat_id:
-        house = data.split(":", 1)[1]
-        if house not in HOUSES:
+        house = normalize_house_key(callback_value(data, "broadcast_house:"))
+        if not house:
             answer_callback(callback_id, "Неизвестный дом")
             return
         answer_callback(callback_id)
         send_message(
             chat_id,
-            f"Оповестить дом {house} об отключении электроэнергии?",
+            f"Оповестить {house_short_label(house)} об отключении электроэнергии?",
             confirm_broadcast_keyboard(house),
         )
         return
 
     if data.startswith("confirm_broadcast:") and chat_id:
-        house = data.split(":", 1)[1]
-        if house not in HOUSES:
+        house = normalize_house_key(callback_value(data, "confirm_broadcast:"))
+        if not house:
             answer_callback(callback_id, "Неизвестный дом")
             return
         queued = enqueue_broadcast(chat_id, house)
         if not queued:
-            answer_callback(callback_id, f"Дом {house}: рассылка уже идет")
+            answer_callback(callback_id, f"{house_label(house)}: рассылка уже идет")
             return
-        answer_callback(callback_id, f"Дом {house}: рассылка поставлена")
-        send_message(chat_id, f"Дом {house}: рассылка поставлена в очередь.")
+        answer_callback(callback_id, f"{house_label(house)}: рассылка поставлена")
+        send_message(chat_id, f"{house_label(house)}: рассылка поставлена в очередь.")
         return
 
     if data.startswith("confirm_broadcasts:") and chat_id:
         houses = [
-            house
-            for house in data.split(":", 1)[1].split(",")
-            if house in HOUSES
+            normalized_house
+            for house in callback_value(data, "confirm_broadcasts:").split(",")
+            for normalized_house in [normalize_house_key(house)]
+            if normalized_house
         ]
         if not houses:
             answer_callback(callback_id, "Неизвестные дома")
@@ -549,14 +635,14 @@ def handle_callback(callback: dict[str, Any]) -> None:
         answer_callback(callback_id, "Обработано")
         lines: list[str] = []
         if queued:
-            lines.append(f"Поставил в очередь дома: {', '.join(queued)}.")
+            lines.append(f"Поставил в очередь: {', '.join(house_label(house) for house in queued)}.")
         if skipped:
-            lines.append(f"Уже идет рассылка по домам: {', '.join(skipped)}.")
+            lines.append(f"Уже идет рассылка: {', '.join(house_label(house) for house in skipped)}.")
         send_message(chat_id, "\n".join(lines))
         return
 
     if data.startswith("confirm_pending:") and chat_id:
-        pending_id = data.split(":", 1)[1]
+        pending_id = callback_value(data, "confirm_pending:")
         pending = pop_pending_broadcast(pending_id)
         if pending is None:
             answer_callback(callback_id, "Уже обработано или устарело")
@@ -574,14 +660,14 @@ def handle_callback(callback: dict[str, Any]) -> None:
         answer_callback(callback_id, "Обработано")
         lines: list[str] = []
         if queued:
-            lines.append(f"Поставил в очередь дома: {', '.join(queued)}.")
+            lines.append(f"Поставил в очередь: {', '.join(house_label(house) for house in queued)}.")
         if skipped:
-            lines.append(f"Уже идет рассылка по домам: {', '.join(skipped)}.")
+            lines.append(f"Уже идет рассылка: {', '.join(house_label(house) for house in skipped)}.")
         send_message(chat_id, "\n".join(lines))
         return
 
     if data.startswith("cancel_pending:") and chat_id:
-        pending_id = data.split(":", 1)[1]
+        pending_id = callback_value(data, "cancel_pending:")
         pop_pending_broadcast(pending_id)
         answer_callback(callback_id, "Отменено")
         send_message(chat_id, "Рассылка отменена.", admin_keyboard())

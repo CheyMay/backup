@@ -1,4 +1,5 @@
 import json
+import itertools
 import os
 import queue
 import re
@@ -39,9 +40,12 @@ OPENER = (
     ).open
 )
 STOP = False
-BROADCAST_QUEUE: queue.Queue[tuple[int, str]] = queue.Queue()
+BROADCAST_QUEUE: queue.Queue[tuple[int, str, str | None]] = queue.Queue()
 ACTIVE_BROADCAST_HOUSES: set[str] = set()
 ACTIVE_BROADCAST_LOCK = threading.Lock()
+PENDING_BROADCASTS: dict[str, tuple[list[str], str | None]] = {}
+PENDING_BROADCAST_LOCK = threading.Lock()
+PENDING_BROADCAST_COUNTER = itertools.count(1)
 
 
 class TelegramApiError(Exception):
@@ -246,6 +250,15 @@ def confirm_multiple_broadcasts_keyboard(houses: list[str]) -> dict[str, Any]:
     }
 
 
+def confirm_pending_broadcast_keyboard(pending_id: str) -> dict[str, Any]:
+    return {
+        "inline_keyboard": [
+            [{"text": "Да, отправить", "callback_data": f"confirm_pending:{pending_id}"}],
+            [{"text": "Отмена", "callback_data": f"cancel_pending:{pending_id}"}],
+        ]
+    }
+
+
 def start_keyboard() -> dict[str, Any]:
     return {
         "inline_keyboard": [
@@ -255,13 +268,38 @@ def start_keyboard() -> dict[str, Any]:
     }
 
 
-def broadcast(house: str) -> tuple[int, int]:
-    text = (
+def create_pending_broadcast(houses: list[str], message_text: str | None) -> str:
+    pending_id = str(next(PENDING_BROADCAST_COUNTER))
+    with PENDING_BROADCAST_LOCK:
+        PENDING_BROADCASTS[pending_id] = (houses, message_text)
+    return pending_id
+
+
+def pop_pending_broadcast(pending_id: str) -> tuple[list[str], str | None] | None:
+    with PENDING_BROADCAST_LOCK:
+        return PENDING_BROADCASTS.pop(pending_id, None)
+
+
+def format_engineer_message(text: str) -> str:
+    lines = [line.strip() for line in text.splitlines()]
+    return "\n".join(line for line in lines if line)
+
+
+def build_broadcast_text(house: str, source_text: str | None = None) -> str:
+    if source_text:
+        message = format_engineer_message(source_text)
+        return f"❗️❗️❗️ Важная информация\n\nДом {house}\n\n{message}"
+
+    return (
         "❗️❗️❗️ Важная информация\n\n"
         f"В доме {house} будет отключение электроэнергии.\n\n"
         "Пожалуйста, не пользуйтесь лифтом, чтобы не застрять в нем. "
         "Заранее завершите важные дела и сохраните данные."
     )
+
+
+def broadcast(house: str, source_text: str | None = None) -> tuple[int, int]:
+    text = build_broadcast_text(house, source_text)
     sent = 0
     failed = 0
 
@@ -278,12 +316,11 @@ def broadcast(house: str) -> tuple[int, int]:
     return sent, failed
 
 
-def parse_houses_from_text(text: str) -> list[str]:
-    normalized = text.lower().replace("ё", "е")
+def parse_houses_from_segment(segment: str) -> list[str]:
     house_pattern = r"(?:дом(?:а|е|ов|ах)?|д\.)\s*(?:№\s*)?[:\-]?\s*([0-9\s,;./\\и№]+)"
     found: list[str] = []
 
-    for match in re.finditer(house_pattern, normalized):
+    for match in re.finditer(house_pattern, segment):
         numbers = re.findall(r"\d+", match.group(1))
         for number in numbers:
             if number in HOUSES and number not in found:
@@ -292,25 +329,41 @@ def parse_houses_from_text(text: str) -> list[str]:
     return found
 
 
-def enqueue_broadcast(admin_chat_id: int, house: str) -> bool:
+def parse_houses_from_text(text: str) -> list[str]:
+    normalized = text.lower().replace("ё", "е")
+
+    if "крымск" in normalized:
+        start = normalized.find("крымск")
+        segment = normalized[start:]
+        next_address = re.search(r"\b(?:переулок|пер\.|улица|ул\.)\b", segment[8:])
+        if next_address:
+            segment = segment[: 8 + next_address.start()]
+        houses = parse_houses_from_segment(segment)
+        if houses:
+            return houses
+
+    return parse_houses_from_segment(normalized)
+
+
+def enqueue_broadcast(admin_chat_id: int, house: str, source_text: str | None = None) -> bool:
     with ACTIVE_BROADCAST_LOCK:
         if house in ACTIVE_BROADCAST_HOUSES:
             return False
         ACTIVE_BROADCAST_HOUSES.add(house)
-    BROADCAST_QUEUE.put((admin_chat_id, house))
+    BROADCAST_QUEUE.put((admin_chat_id, house, source_text))
     return True
 
 
 def broadcast_worker() -> None:
     while not STOP:
         try:
-            admin_chat_id, house = BROADCAST_QUEUE.get(timeout=1)
+            admin_chat_id, house, source_text = BROADCAST_QUEUE.get(timeout=1)
         except queue.Empty:
             continue
 
         try:
             send_message(admin_chat_id, f"Рассылка по дому {house} запущена.")
-            sent, failed = broadcast(house)
+            sent, failed = broadcast(house, source_text)
             send_message(
                 admin_chat_id,
                 f"Дом {house}: рассылка завершена. Доставлено: {sent}. Ошибок: {failed}.",
@@ -365,15 +418,11 @@ def handle_message(message: dict[str, Any]) -> None:
         houses = parse_houses_from_text(text)
         if houses:
             houses_text = ", ".join(houses)
-            keyboard = (
-                confirm_broadcast_keyboard(houses[0])
-                if len(houses) == 1
-                else confirm_multiple_broadcasts_keyboard(houses)
-            )
+            pending_id = create_pending_broadcast(houses, text)
             send_message(
                 chat_id,
                 f"Нашел дома: {houses_text}.\nОповестить об отключении электроэнергии?",
-                keyboard,
+                confirm_pending_broadcast_keyboard(pending_id),
             )
             return
 
@@ -504,6 +553,38 @@ def handle_callback(callback: dict[str, Any]) -> None:
         if skipped:
             lines.append(f"Уже идет рассылка по домам: {', '.join(skipped)}.")
         send_message(chat_id, "\n".join(lines))
+        return
+
+    if data.startswith("confirm_pending:") and chat_id:
+        pending_id = data.split(":", 1)[1]
+        pending = pop_pending_broadcast(pending_id)
+        if pending is None:
+            answer_callback(callback_id, "Уже обработано или устарело")
+            return
+
+        houses, source_text = pending
+        queued: list[str] = []
+        skipped: list[str] = []
+        for house in houses:
+            if enqueue_broadcast(chat_id, house, source_text):
+                queued.append(house)
+            else:
+                skipped.append(house)
+
+        answer_callback(callback_id, "Обработано")
+        lines: list[str] = []
+        if queued:
+            lines.append(f"Поставил в очередь дома: {', '.join(queued)}.")
+        if skipped:
+            lines.append(f"Уже идет рассылка по домам: {', '.join(skipped)}.")
+        send_message(chat_id, "\n".join(lines))
+        return
+
+    if data.startswith("cancel_pending:") and chat_id:
+        pending_id = data.split(":", 1)[1]
+        pop_pending_broadcast(pending_id)
+        answer_callback(callback_id, "Отменено")
+        send_message(chat_id, "Рассылка отменена.", admin_keyboard())
         return
 
     if data == "cancel_broadcast" and chat_id:

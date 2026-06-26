@@ -1,6 +1,7 @@
 import json
 import os
 import queue
+import re
 import signal
 import sqlite3
 import sys
@@ -235,6 +236,16 @@ def confirm_broadcast_keyboard(house: str) -> dict[str, Any]:
     }
 
 
+def confirm_multiple_broadcasts_keyboard(houses: list[str]) -> dict[str, Any]:
+    houses_value = ",".join(houses)
+    return {
+        "inline_keyboard": [
+            [{"text": "Да, отправить", "callback_data": f"confirm_broadcasts:{houses_value}"}],
+            [{"text": "Отмена", "callback_data": "cancel_broadcast"}],
+        ]
+    }
+
+
 def start_keyboard() -> dict[str, Any]:
     return {
         "inline_keyboard": [
@@ -265,6 +276,20 @@ def broadcast(house: str) -> tuple[int, int]:
                 remove_subscriber(chat_id)
 
     return sent, failed
+
+
+def parse_houses_from_text(text: str) -> list[str]:
+    normalized = text.lower().replace("ё", "е")
+    house_pattern = r"(?:дом(?:а|е|ов|ах)?|д\.)\s*(?:№\s*)?[:\-]?\s*([0-9\s,;./\\и№]+)"
+    found: list[str] = []
+
+    for match in re.finditer(house_pattern, normalized):
+        numbers = re.findall(r"\d+", match.group(1))
+        for number in numbers:
+            if number in HOUSES and number not in found:
+                found.append(number)
+
+    return found
 
 
 def enqueue_broadcast(admin_chat_id: int, house: str) -> bool:
@@ -335,6 +360,31 @@ def handle_message(message: dict[str, Any]) -> None:
             return
         send_message(chat_id, "Панель администратора:", admin_keyboard())
         return
+
+    if is_admin(user_id):
+        houses = parse_houses_from_text(text)
+        if houses:
+            houses_text = ", ".join(houses)
+            keyboard = (
+                confirm_broadcast_keyboard(houses[0])
+                if len(houses) == 1
+                else confirm_multiple_broadcasts_keyboard(houses)
+            )
+            send_message(
+                chat_id,
+                f"Нашел дома: {houses_text}.\nОповестить об отключении электроэнергии?",
+                keyboard,
+            )
+            return
+
+        normalized = text.lower().replace("ё", "е")
+        if any(word in normalized for word in ("отключ", "свет", "электро", "энерг")):
+            send_message(
+                chat_id,
+                "Похоже на сообщение об отключении, но я не нашел номера домов. Выберите дом вручную:",
+                admin_house_keyboard(),
+            )
+            return
 
     send_message(chat_id, "Команды: /start - подписаться, /stop - отписаться.")
 
@@ -427,6 +477,33 @@ def handle_callback(callback: dict[str, Any]) -> None:
             return
         answer_callback(callback_id, f"Дом {house}: рассылка поставлена")
         send_message(chat_id, f"Дом {house}: рассылка поставлена в очередь.")
+        return
+
+    if data.startswith("confirm_broadcasts:") and chat_id:
+        houses = [
+            house
+            for house in data.split(":", 1)[1].split(",")
+            if house in HOUSES
+        ]
+        if not houses:
+            answer_callback(callback_id, "Неизвестные дома")
+            return
+
+        queued: list[str] = []
+        skipped: list[str] = []
+        for house in houses:
+            if enqueue_broadcast(chat_id, house):
+                queued.append(house)
+            else:
+                skipped.append(house)
+
+        answer_callback(callback_id, "Обработано")
+        lines: list[str] = []
+        if queued:
+            lines.append(f"Поставил в очередь дома: {', '.join(queued)}.")
+        if skipped:
+            lines.append(f"Уже идет рассылка по домам: {', '.join(skipped)}.")
+        send_message(chat_id, "\n".join(lines))
         return
 
     if data == "cancel_broadcast" and chat_id:
